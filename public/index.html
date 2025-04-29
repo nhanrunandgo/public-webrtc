@@ -1,0 +1,311 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebRTC Group Call</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    body {
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      background: #1a1a1a;
+      font-family: Arial, sans-serif;
+    }
+
+    #preview {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #preview video {
+      width: 80%;
+      max-width: 600px;
+      border-radius: 8px;
+      background: #333;
+    }
+
+    #grid {
+        display: none;
+        flex: 1;
+        max-height: calc(100vh - 80px); /* 80px là độ cao tạm cho nút “Rời cuộc gọi” + padding, bạn chỉnh cho phù hợp */
+        overflow-y: auto;
+        padding: 10px;
+        gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        grid-auto-rows: minmax(200px, 1fr);
+    }
+
+    .video-item {
+        position: relative;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #333;
+        aspect-ratio: 16 / 9;    /* đảm bảo video luôn 16:9 */
+        height: auto;            /* chiều cao tự điều chỉnh theo rộng */
+    }
+
+    .video-item video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: center center;  /* <-- căn giữa nội dung video */
+    }
+
+    .video-item .label {
+      position: absolute;
+      bottom: 8px;
+      left: 8px;
+      color: white;
+      background: rgba(0,0,0,0.7);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+
+    button {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 25px;
+      font-size: 16px;
+      cursor: pointer;
+      transition: opacity 0.3s;
+    }
+
+    #joinBtn {
+      background: #00c853;
+      color: white;
+      margin-top: 20px;
+    }
+
+    #leaveBtn {
+      background: #d50000;
+      color: white;
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: none;
+    }
+
+    @media (max-width: 600px) {
+      #grid {
+        grid-template-columns: 1fr !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="preview">
+    <video id="previewVideo" autoplay muted playsinline></video>
+    <button id="joinBtn">Tham gia cuộc gọi</button>
+  </div>
+
+  <div id="grid"></div>
+  <button id="leaveBtn">Rời cuộc gọi</button>
+
+  <script>
+    const preview = document.getElementById('preview');
+    const grid = document.getElementById('grid');
+    const previewVideo = document.getElementById('previewVideo');
+    const joinBtn = document.getElementById('joinBtn');
+    const leaveBtn = document.getElementById('leaveBtn');
+
+    let localStream, ws, clientId;
+    const peers = {};
+    const peersInfo = {};
+
+    async function startPreview() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        previewVideo.srcObject = localStream;
+      } catch (error) {
+        alert('Lỗi khi truy cập camera/micro!');
+      }
+    }
+
+    function updateGrid() {
+        const count = grid.children.length;
+        // Khi ít người, cho min-width nhỏ hơn
+        const min = count <= 2 ? 250 : 200;
+        grid.style.gridTemplateColumns =
+          `repeat(auto-fit, minmax(${min}px, 1fr))`;
+    }
+      
+
+    function addVideo(id, stream, name, isLocal = false) {
+      if (document.getElementById(`vid-${id}`)) return;
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'video-item';
+      wrapper.id = `vid-${id}`;
+
+      const video = document.createElement('video');
+      video.autoplay = true;
+      video.playsInline = true;
+      video.muted = isLocal;
+      video.srcObject = stream;
+
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = isLocal ? `${name} (Bạn)` : name;
+
+      wrapper.append(video, label);
+      grid.appendChild(wrapper);
+      updateGrid();
+    }
+
+    function removeVideo(id) {
+      const element = document.getElementById(`vid-${id}`);
+      if (element) element.remove();
+      updateGrid();
+    }
+
+    const iceConfig = {
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        {
+        urls: [
+            'turn:webrtc.runandgo.xyz:3478',
+            'turns:webrtc.runandgo.xyz:5349'
+        ],
+        username: 'webrtcuser',         // match config coturn
+        credential: 'turnpassword'
+        }
+    ],
+    iceCandidatePoolSize: 10
+    };
+
+    function createPeerConnection(peerId) {
+      const pc = new RTCPeerConnection(iceConfig);
+      peers[peerId] = pc;
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+      pc.ontrack = (event) => {
+        const stream = event.streams[0];
+        addVideo(peerId, stream, peersInfo[peerId] || 'Ẩn danh');
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          ws.send(JSON.stringify({
+            type: 'candidate',
+            to: peerId,
+            candidate: event.candidate
+          }));
+        }
+      };
+
+      return pc;
+    }
+
+    joinBtn.onclick = async () => {
+      let name;
+      while (!name?.trim()) {
+        name = prompt('Nhập tên của bạn:');
+      }
+
+      preview.style.display = 'none';
+      grid.style.display = 'grid';
+      leaveBtn.style.display = 'block';
+      addVideo('local', localStream, name, true);
+
+      ws = new WebSocket(`wss://${location.host}`);
+      
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'join', name }));
+      };
+
+      ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        
+        switch (msg.type) {
+            case 'init': {
+                clientId = msg.id;
+                peersInfo[clientId] = name;
+                // Với mỗi peer cũ, tạo connection và ngay lập tức làm offer
+                msg.peers.forEach(peer => {
+                  peersInfo[peer.id] = peer.name;
+                  const pc = createPeerConnection(peer.id);
+                  createOffer(pc, peer.id);
+                });
+                break;
+              }
+              
+            // --- 2. Trong ws.onmessage, xử lý new-peer ở peer cũ: ---
+            case 'new-peer': {
+            peersInfo[msg.id] = msg.name;
+            if (!peers[msg.id]) {
+                // Chỉ tạo PeerConnection, không gọi createOffer
+                createPeerConnection(msg.id);
+                // => chờ peer mới gửi offer tới, rồi mới answer
+            }
+            break;
+            }
+
+          case 'offer':
+            const pc = peers[msg.from] || createPeerConnection(msg.from);
+            await pc.setRemoteDescription(msg.offer);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({
+              type: 'answer',
+              to: msg.from,
+              answer
+            }));
+            break;
+
+          case 'answer':
+            if (peers[msg.from]) {
+              await peers[msg.from].setRemoteDescription(msg.answer);
+            }
+            break;
+
+          case 'candidate':
+            if (peers[msg.from]) {
+              await peers[msg.from].addIceCandidate(msg.candidate);
+            }
+            break;
+
+          case 'peer-left':
+            if (peers[msg.id]) {
+              peers[msg.id].close();
+              delete peers[msg.id];
+            }
+            delete peersInfo[msg.id];
+            removeVideo(msg.id);
+            break;
+        }
+      };
+    };
+
+    async function createOffer(pc, peerId) {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({
+        type: 'offer',
+        to: peerId,
+        offer
+      }));
+    }
+
+    leaveBtn.onclick = () => {
+      Object.values(peers).forEach(pc => pc.close());
+      ws?.close();
+      grid.innerHTML = '';
+      preview.style.display = 'flex';
+      leaveBtn.style.display = 'none';
+      startPreview();
+    };
+
+    startPreview();
+  </script>
+</body>
+</html>
